@@ -32,3 +32,14 @@ curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhous
 ```
 
 Cada iteração gera um trace com 3 spans (`GET <rota>`, `db.query`, `payment.authorize`), um log e medições das métricas `app.requests`, `app.request.duration`, `app.cart.items` e `app.queue.depth`. Cerca de 15% das requisições falham com pagamento recusado.
+
+## Simular um incidente
+
+`incident_app.py` envia o mesmo serviço `checkout-demo`, mas com o pagamento lento (0,6 a 1,2 s) e recusado em 80% das requisições, por alguns minutos. Serve para disparar triggers de latência e de erros. Rode junto com o `test_app.py`, na mesma venv:
+
+```bash
+curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhouse/main/incident_app.py
+.venv/bin/python incident_app.py --endpoint http://<IP_APM>:4317 --mode both --minutes 6
+```
+
+`--mode latency` deixa só a lentidão, `--mode errors` só os erros.
