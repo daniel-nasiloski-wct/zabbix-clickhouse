@@ -1,8 +1,11 @@
-"""Simula 5 serviços que se chamam entre si e envia traces, métricas e logs via OTLP/gRPC.
+"""Simula 4 aplicações de clientes diferentes, com 17 serviços, e envia traces, métricas e logs via OTLP/gRPC.
 
-checkout-demo chama auth-service, payment-gateway, shipping-service e catalog-api, então cada
-requisição gera um trace distribuído. Com --incident, um serviço sorteado fica lento ou começa a
-falhar durante toda a execução.
+Cada aplicação tem um serviço de entrada que chama os outros, então cada requisição gera um trace distribuído:
+  - loja-online:    checkout-demo -> auth-service, payment-gateway, shipping-service, catalog-api
+  - banco-digital:  bank-portal -> account-service, fraud-engine, notification-service
+  - streaming:      stream-hub -> entitlement-service, media-service, recommendation-service
+  - logistica:      fleet-tracker -> telemetry-ingest, routing-engine -> traffic-service
+Com --incident, um serviço sorteado fica lento ou começa a falhar durante toda a execução.
 
 Uso:
     .venv/bin/python multi_app.py [--endpoint http://192.168.128.101:4317] [--iterations 30] [--interval 2] [--incident]
@@ -26,14 +29,25 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import SpanKind, Status, StatusCode
 
-SERVICES = ["checkout-demo", "catalog-api", "auth-service", "payment-gateway", "shipping-service"]
+# serviço -> cliente (service.namespace)
+TENANTS = {
+    "checkout-demo": "loja-online", "catalog-api": "loja-online", "auth-service": "loja-online",
+    "payment-gateway": "loja-online", "shipping-service": "loja-online",
+    "bank-portal": "banco-digital", "account-service": "banco-digital", "fraud-engine": "banco-digital",
+    "notification-service": "banco-digital",
+    "stream-hub": "streaming", "entitlement-service": "streaming", "media-service": "streaming",
+    "recommendation-service": "streaming",
+    "fleet-tracker": "logistica", "telemetry-ingest": "logistica", "routing-engine": "logistica",
+    "traffic-service": "logistica",
+}
+SERVICES = list(TENANTS)
 MODES = ["latency", "errors"]
 
 
 class Service:
     def __init__(self, name, endpoint):
         self.name = name
-        resource = Resource.create({"service.name": name, "service.version": "1.0.0",
+        resource = Resource.create({"service.name": name, "service.namespace": TENANTS[name], "service.version": "1.0.0",
                                     "deployment.environment": "lab", "host.name": "multi-app"})
         self.tp = TracerProvider(resource=resource)
         self.tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
@@ -122,11 +136,11 @@ def main():
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--interval", type=float, default=2.0)
     parser.add_argument("--incident", action="store_true",
-                        help="deixa um dos 5 serviços, sorteado, lento ou com erros durante a execução")
+                        help="deixa um dos 17 serviços, sorteado, lento ou com erros durante a execução")
     args = parser.parse_args()
 
     s = {name: Service(name, args.endpoint) for name in SERVICES}
-    checkout, catalog, auth, payment, shipping = (s[n] for n in SERVICES)
+    checkout, catalog, auth, payment, shipping = (s[n] for n in SERVICES[:5])
     if args.incident:
         incident.update(service=random.choice(SERVICES), mode=random.choice(MODES))
         kind = "latência alta" if incident["mode"] == "latency" else "erros"
@@ -183,9 +197,127 @@ def main():
                 call(checkout, "catalog.list", catalog_list)
         serve(checkout, f"GET {route}", h, {"http.request.method": "GET", "url.path": route})
 
-    # Por iteração: uma compra no checkout-demo (que chama os outros serviços), mais uma consulta
-    # direta ao catálogo, um login e uma cobrança e um frete avulsos, para todos terem tráfego parecido.
-    entries = [checkout_request, catalog_list, auth_login, payment_charge, shipping_create]
+
+    # banco-digital
+    bank, account, fraud, notify = (s[n] for n in ("bank-portal", "account-service", "fraud-engine",
+                                                   "notification-service"))
+
+    def account_balance():
+        serve(account, "GET /balance", lambda: step(account, "db.query", SpanKind.CLIENT, 0.01, 0.04, 0.01,
+                                                     slow=(0.5, 1.0), error_msg="timeout no PostgreSQL",
+                                                     attrs={"db.system": "postgresql"}))
+
+    def account_debit():
+        def h():
+            step(account, "ledger.write", SpanKind.CLIENT, 0.03, 0.08, 0.02, slow=(0.7, 1.3),
+                 error_msg="lock no ledger", attrs={"db.system": "postgresql"})
+            step(account, "audit.log", SpanKind.INTERNAL, 0.002, 0.008)
+        serve(account, "POST /debit", h)
+
+    def fraud_score():
+        def h():
+            step(fraud, "feature.lookup", SpanKind.CLIENT, 0.002, 0.01, attrs={"db.system": "redis"})
+            step(fraud, "model.predict", SpanKind.INTERNAL, 0.02, 0.06, 0.02, slow=(0.6, 1.2),
+                 error_msg="modelo indisponível")
+        serve(fraud, "POST /score", h)
+
+    def notify_send():
+        def h():
+            step(notify, "template.render", SpanKind.INTERNAL, 0.002, 0.008)
+            step(notify, "sms.send", SpanKind.CLIENT, 0.04, 0.1, 0.03, slow=(0.8, 1.5),
+                 error_msg="provedor de SMS falhou", attrs={"server.address": "api.sms.lab"})
+        serve(notify, "POST /notify", h)
+
+    def bank_request():
+        route = random.choices(["POST /transfer", "GET /balance"], [0.6, 0.4])[0]
+
+        def h():
+            step(bank, "session.check", SpanKind.INTERNAL, 0.002, 0.008, 0.01, slow=(0.4, 0.8),
+                 error_msg="sessão expirada")
+            if route == "POST /transfer":
+                call(bank, "fraud.score", fraud_score)
+                call(bank, "account.debit", account_debit)
+                call(bank, "notification.send", notify_send)
+            else:
+                call(bank, "account.balance", account_balance)
+        serve(bank, route, h)
+
+    # streaming
+    stream, entitle, media, recommend = (s[n] for n in ("stream-hub", "entitlement-service", "media-service",
+                                                        "recommendation-service"))
+
+    def entitlement_check():
+        def h():
+            step(entitle, "cache.get", SpanKind.CLIENT, 0.001, 0.005, attrs={"db.system": "redis"})
+            step(entitle, "plan.check", SpanKind.INTERNAL, 0.003, 0.01, 0.01, slow=(0.4, 0.9),
+                 error_msg="plano não encontrado")
+        serve(entitle, "GET /entitlement", h)
+
+    def media_manifest():
+        def h():
+            step(media, "object.get", SpanKind.CLIENT, 0.02, 0.07, 0.02, slow=(0.8, 1.6),
+                 error_msg="objeto não encontrado no storage", attrs={"server.address": "s3.lab"})
+            step(media, "cdn.sign", SpanKind.CLIENT, 0.01, 0.03, 0.01, attrs={"server.address": "cdn.video.lab"})
+        serve(media, "GET /manifest", h)
+
+    def recommend_list():
+        def h():
+            step(recommend, "db.query", SpanKind.CLIENT, 0.02, 0.06, 0.02, slow=(0.6, 1.2),
+                 error_msg="timeout no Cassandra", attrs={"db.system": "cassandra"})
+            step(recommend, "model.rank", SpanKind.INTERNAL, 0.01, 0.04)
+        serve(recommend, "GET /recommendations", h)
+
+    def stream_request():
+        route = random.choices(["GET /play", "GET /home"], [0.6, 0.4])[0]
+
+        def h():
+            call(stream, "entitlement.check", entitlement_check)
+            if route == "GET /play":
+                call(stream, "media.manifest", media_manifest)
+            else:
+                call(stream, "recommendation.list", recommend_list)
+        serve(stream, route, h)
+
+    # logistica
+    fleet, ingest, routing, traffic = (s[n] for n in ("fleet-tracker", "telemetry-ingest", "routing-engine",
+                                                      "traffic-service"))
+
+    def ingest_positions():
+        def h():
+            step(ingest, "payload.validate", SpanKind.INTERNAL, 0.001, 0.004, 0.01, error_msg="payload inválido")
+            step(ingest, "kafka.produce", SpanKind.CLIENT, 0.005, 0.02, 0.01, slow=(0.5, 1.1),
+                 error_msg="broker indisponível", attrs={"server.address": "kafka.lab"})
+        serve(ingest, "POST /positions", h)
+
+    def traffic_status():
+        def h():
+            step(traffic, "cache.get", SpanKind.CLIENT, 0.001, 0.005, attrs={"db.system": "redis"})
+            step(traffic, "feed.fetch", SpanKind.CLIENT, 0.03, 0.08, 0.03, slow=(0.7, 1.4),
+                 error_msg="feed de trânsito fora do ar", attrs={"server.address": "api.transito.lab"})
+        serve(traffic, "GET /traffic", h)
+
+    def routing_route():
+        def h():
+            step(routing, "geo.query", SpanKind.CLIENT, 0.02, 0.05, 0.01, slow=(0.6, 1.2),
+                 error_msg="timeout no PostGIS", attrs={"db.system": "postgresql"})
+            call(routing, "traffic.status", traffic_status)
+            step(routing, "maps.directions", SpanKind.CLIENT, 0.04, 0.1, 0.02, attrs={"server.address": "api.mapas.lab"})
+        serve(routing, "GET /route", h)
+
+    def fleet_request():
+        route = random.choice(["POST /positions", "GET /route"])
+
+        def h():
+            if route == "POST /positions":
+                call(fleet, "telemetry.ingest", ingest_positions)
+            else:
+                call(fleet, "routing.route", routing_route)
+        serve(fleet, route, h)
+
+    # Por iteração: uma requisição na entrada de cada aplicação. Na loja, também uma consulta direta ao
+    # catálogo, um login e uma cobrança e um frete avulsos, para todos terem tráfego parecido.
+    entries = [checkout_request, catalog_list, auth_login, payment_charge, shipping_create,
+               bank_request, stream_request, fleet_request]
     try:
         for i in range(args.iterations):
             for fn in entries:

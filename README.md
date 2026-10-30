@@ -44,13 +44,22 @@ curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhous
 
 `--mode latency` deixa só a lentidão, `--mode errors` só os erros.
 
-## Simular vários serviços
+## Simular várias aplicações
 
-`multi_app.py` simula 5 serviços que se chamam entre si: `checkout-demo` chama `auth-service`, `payment-gateway`, `shipping-service` e `catalog-api`, então cada requisição gera um trace distribuído. Na mesma venv:
+`multi_app.py` simula 4 aplicações de clientes diferentes, com 17 serviços que se chamam entre si; cada requisição gera um trace distribuído:
+
+| Aplicação (`service.namespace`) | Entrada | Serviços chamados |
+| --- | --- | --- |
+| loja-online | `checkout-demo` | `auth-service`, `payment-gateway`, `shipping-service`, `catalog-api` |
+| banco-digital | `bank-portal` | `account-service`, `fraud-engine`, `notification-service` |
+| streaming | `stream-hub` | `entitlement-service`, `media-service`, `recommendation-service` |
+| logistica | `fleet-tracker` | `telemetry-ingest`, `routing-engine` → `traffic-service` |
+
+Na mesma venv:
 
 ```bash
 curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhouse/main/multi_app.py
 .venv/bin/python multi_app.py --endpoint http://<IP_APM>:4317 --iterations 300 --interval 2
 ```
 
-Com `--incident`, um dos 5 serviços, sorteado, fica lento ou com erros durante toda a execução; o script mostra qual no início. Quem chama o serviço afetado (normalmente o `checkout-demo`) também sente o incidente.
+Com `--incident`, um dos 17 serviços, sorteado, fica lento ou com erros durante toda a execução; o script mostra qual no início. Quem chama o serviço afetado também sente o incidente.
