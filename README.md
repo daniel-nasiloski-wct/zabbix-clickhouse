@@ -43,3 +43,14 @@ curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhous
 ```
 
 `--mode latency` deixa só a lentidão, `--mode errors` só os erros.
+
+## Simular vários serviços
+
+`multi_app.py` simula 5 serviços que se chamam entre si: `checkout-demo` chama `auth-service`, `payment-gateway`, `shipping-service` e `catalog-api`, então cada requisição gera um trace distribuído. Na mesma venv:
+
+```bash
+curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhouse/main/multi_app.py
+.venv/bin/python multi_app.py --endpoint http://<IP_APM>:4317 --chaos
+```
+
+Com `--chaos`, a cada 10 minutos um serviço sorteado fica lento ou começa a falhar por 5 minutos. Para disparar um incidente na hora, use `--incident payment-gateway:latency:5` (serviço, `latency` ou `errors`, minutos).
