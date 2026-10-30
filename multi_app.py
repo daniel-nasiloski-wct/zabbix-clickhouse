@@ -1,11 +1,11 @@
 """Simula 5 serviços que se chamam entre si e envia traces, métricas e logs via OTLP/gRPC.
 
 checkout-demo chama auth-service, payment-gateway, shipping-service e catalog-api, então cada
-requisição gera um trace distribuído. Com --chaos, de tempos em tempos um serviço sorteado fica lento
-ou começa a falhar por alguns minutos.
+requisição gera um trace distribuído. Com --incident, um serviço sorteado fica lento ou começa a
+falhar durante toda a execução.
 
 Uso:
-    .venv/bin/python multi_app.py --endpoint http://<IP_APM>:4317 [--chaos] [--incident payment-gateway:latency:5]
+    .venv/bin/python multi_app.py [--endpoint http://192.168.128.101:4317] [--iterations 30] [--interval 2] [--incident]
 """
 
 import argparse
@@ -13,7 +13,7 @@ import logging
 import random
 import time
 
-from opentelemetry import context, metrics, trace
+from opentelemetry import context
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -39,10 +39,11 @@ class Service:
         self.tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
         self.tracer = self.tp.get_tracer(f"{name}.tracer", "1.0.0")
         self.mp = MeterProvider(resource=resource, metric_readers=[PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=endpoint, insecure=True), export_interval_millis=10000)])
+            OTLPMetricExporter(endpoint=endpoint, insecure=True), export_interval_millis=5000)])
         meter = self.mp.get_meter(f"{name}.meter", "1.0.0")
-        self.requests = meter.create_counter("app.requests", unit="1")
-        self.duration = meter.create_histogram("app.request.duration", unit="ms")
+        self.requests = meter.create_counter("app.requests", unit="1", description="Total de requisições")
+        self.duration = meter.create_histogram("app.request.duration", unit="ms",
+                                               description="Duração das requisições")
         self.lp = LoggerProvider(resource=resource)
         self.lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter(endpoint=endpoint, insecure=True)))
         self.log = logging.getLogger(name)
@@ -60,12 +61,11 @@ class Failure(Exception):
     pass
 
 
-incidents = {}  # serviço -> (modo, fim)
+incident = {}  # {"service": ..., "mode": ...} quando --incident
 
 
 def degraded(svc, mode):
-    inc = incidents.get(svc)
-    return inc is not None and inc[0] == mode and time.time() < inc[1]
+    return incident.get("service") == svc and incident.get("mode") == mode
 
 
 def step(svc, name, kind, low, high, fail_rate=0.0, slow=None, error_msg="falha", attrs=None):
@@ -118,22 +118,19 @@ def call(caller, name, callee_fn):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", required=True, help="proxy APM do Zabbix, ex.: http://<IP_APM>:4317")
-    parser.add_argument("--chaos", action="store_true", help="sorteia incidentes de tempos em tempos")
-    parser.add_argument("--chaos-every", type=float, default=10.0, help="minutos entre incidentes")
-    parser.add_argument("--chaos-minutes", type=float, default=5.0, help="duração de cada incidente")
-    parser.add_argument("--chaos-start", type=float, default=10.0, help="minutos até o primeiro incidente")
-    parser.add_argument("--incident", action="append", default=[],
-                        help="serviço:modo:minutos, ex.: payment-gateway:latency:5 (pode repetir)")
-    parser.add_argument("--minutes", type=float, default=0, help="duração total; 0 = sem fim")
+    parser.add_argument("--endpoint", default="http://192.168.128.101:4317", help="proxy APM do Zabbix")
+    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--interval", type=float, default=2.0)
+    parser.add_argument("--incident", action="store_true",
+                        help="deixa um dos 5 serviços, sorteado, lento ou com erros durante a execução")
     args = parser.parse_args()
 
     s = {name: Service(name, args.endpoint) for name in SERVICES}
     checkout, catalog, auth, payment, shipping = (s[n] for n in SERVICES)
-    for spec in args.incident:
-        name, mode, minutes = spec.split(":")
-        incidents[name] = (mode, time.time() + float(minutes) * 60)
-        print(f"incidente manual: {name} {mode} por {minutes} min", flush=True)
+    if args.incident:
+        incident.update(service=random.choice(SERVICES), mode=random.choice(MODES))
+        kind = "latência alta" if incident["mode"] == "latency" else "erros"
+        print(f"Incidente: {incident['service']} com {kind}", flush=True)
 
     def auth_validate():
         serve(auth, "POST /validate", lambda: step(auth, "token.verify", SpanKind.INTERNAL, 0.005, 0.02,
@@ -141,26 +138,23 @@ def main():
 
     def auth_login():
         def h():
-            step(auth, "ldap.bind", SpanKind.CLIENT, 0.02, 0.06, 0.05, slow=(0.6, 1.2), error_msg="LDAP indisponível",
+            step(auth, "ldap.bind", SpanKind.CLIENT, 0.02, 0.06, 0.03, slow=(0.6, 1.2), error_msg="LDAP indisponível",
                  attrs={"server.address": "ldap.lab"})
             step(auth, "token.sign", SpanKind.INTERNAL, 0.002, 0.01)
         serve(auth, "POST /login", h)
 
     def catalog_list():
         def h():
+            step(catalog, "cache.get", SpanKind.CLIENT, 0.001, 0.005, attrs={"db.system": "redis"})
             if random.random() < 0.3 or degraded("catalog-api", "latency"):
-                step(catalog, "cache.get", SpanKind.CLIENT, 0.001, 0.005, attrs={"db.system": "redis"})
-                step(catalog, "db.query", SpanKind.CLIENT, 0.03, 0.09, 0.02, slow=(0.5, 1.1),
+                step(catalog, "db.query", SpanKind.CLIENT, 0.03, 0.09, 0.03, slow=(0.5, 1.1),
                      error_msg="timeout no PostgreSQL", attrs={"db.system": "postgresql"})
-            else:
-                step(catalog, "cache.get", SpanKind.CLIENT, 0.001, 0.005, 0.0, error_msg="Redis indisponível",
-                     attrs={"db.system": "redis"})
         serve(catalog, "GET /catalog", h)
 
     def payment_charge():
         def h():
             step(payment, "fraud.check", SpanKind.INTERNAL, 0.01, 0.03)
-            step(payment, "bank.api", SpanKind.CLIENT, 0.05, 0.15, 0.12, slow=(0.8, 1.5),
+            step(payment, "bank.api", SpanKind.CLIENT, 0.05, 0.15, 0.05, slow=(0.8, 1.5),
                  error_msg="banco recusou a transação", attrs={"server.address": "api.banco.lab"})
         serve(payment, "POST /charge", h)
 
@@ -189,30 +183,21 @@ def main():
                 call(checkout, "catalog.list", catalog_list)
         serve(checkout, f"GET {route}", h, {"http.request.method": "GET", "url.path": route})
 
-    entries = [(checkout_request, 0.5), (catalog_list, 0.25), (auth_login, 0.25)]
-    started = time.time()
-    next_chaos = started + args.chaos_start * 60
-    end = started + args.minutes * 60 if args.minutes else None
-    n = 0
+    # Por iteração: uma compra no checkout-demo (que chama os outros serviços), mais uma consulta
+    # direta ao catálogo, um login e uma cobrança e um frete avulsos, para todos terem tráfego parecido.
+    entries = [checkout_request, catalog_list, auth_login, payment_charge, shipping_create]
     try:
-        while end is None or time.time() < end:
-            if args.chaos and time.time() >= next_chaos:
-                name, mode = random.choice(SERVICES), random.choice(MODES)
-                incidents[name] = (mode, time.time() + args.chaos_minutes * 60)
-                print(f"{time.strftime('%H:%M:%S')} incidente: {name} {mode} por {args.chaos_minutes:.0f} min", flush=True)
-                next_chaos = time.time() + args.chaos_every * 60
-            fn = random.choices([e[0] for e in entries], [e[1] for e in entries])[0]
-            token = context.attach(context.Context())
-            try:
-                fn()
-            except Failure:
-                pass
-            finally:
-                context.detach(token)
-            n += 1
-            if n % 60 == 0:
-                print(f"{time.strftime('%H:%M:%S')} {n} requisições enviadas", flush=True)
-            time.sleep(1)
+        for i in range(args.iterations):
+            for fn in entries:
+                token = context.attach(context.Context())
+                try:
+                    fn()
+                except Failure:
+                    pass
+                finally:
+                    context.detach(token)
+            print(f"{time.strftime('%H:%M:%S')} iteração {i + 1}/{args.iterations}", flush=True)
+            time.sleep(args.interval)
     finally:
         for svc in s.values():
             svc.shutdown()

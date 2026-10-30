@@ -50,7 +50,7 @@ curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhous
 
 ```bash
 curl -LO https://raw.githubusercontent.com/daniel-nasiloski-wct/zabbix-clickhouse/main/multi_app.py
-.venv/bin/python multi_app.py --endpoint http://<IP_APM>:4317 --chaos
+.venv/bin/python multi_app.py --endpoint http://<IP_APM>:4317 --iterations 300 --interval 2
 ```
 
-Com `--chaos`, a cada 10 minutos um serviço sorteado fica lento ou começa a falhar por 5 minutos. Para disparar um incidente na hora, use `--incident payment-gateway:latency:5` (serviço, `latency` ou `errors`, minutos).
+Com `--incident`, um dos 5 serviços, sorteado, fica lento ou com erros durante toda a execução; o script mostra qual no início. Quem chama o serviço afetado (normalmente o `checkout-demo`) também sente o incidente.
